@@ -27,7 +27,9 @@ log = logging.getLogger("scanner")
 # =========================
 
 load_dotenv()
+
 TOKEN = os.getenv("BOT_TOKEN")
+DB_PATH = "users.db"
 
 if not TOKEN:
     raise ValueError("BOT_TOKEN not found")
@@ -43,10 +45,8 @@ bot = Bot(
 
 dp = Dispatcher()
 
-DB = "users.db"
-
 # =========================
-# ANTI-DUPLICATES (BY CANDLE)
+# ANTI DUPLICATES BY CANDLE
 # =========================
 
 sent_signals = set()
@@ -59,25 +59,61 @@ def is_duplicate(ticker, candle_time, sig_type):
     return False
 
 # =========================
-# PRICE NORMALIZATION (MOEX FIX)
+# DB INIT (ПРАВИЛЬНАЯ)
 # =========================
 
-def normalize_price(price: float) -> float:
-    if price is None:
-        return 0
+async def init_db():
+    """
+    ЕДИНСТВЕННОЕ место создания БД
+    гарантированно вызывается ДО scan()
+    """
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            is_pro INTEGER DEFAULT 0,
+            signals_today INTEGER DEFAULT 0
+        )
+        """)
+        await db.commit()
 
-    # MOEX garbage protection
-    if price > 10_000_000:
-        return price / 1000
-    if price > 1_000_000:
-        return price / 100
-    if price <= 0:
-        return 0
-
-    return price
+    log.info("Database initialized")
 
 # =========================
-# RSI (CLEAN VERSION)
+# USERS
+# =========================
+
+async def add_user(uid):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute("""
+        INSERT OR IGNORE INTO users (user_id)
+        VALUES (?)
+        """, (uid,))
+        await db.commit()
+
+
+async def get_users():
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("SELECT user_id, is_pro FROM users")
+        return await cur.fetchall()
+
+
+async def update_limit(uid, is_pro):
+    if is_pro:
+        return True
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute("""
+        UPDATE users
+        SET signals_today = signals_today + 1
+        WHERE user_id = ? AND signals_today < 3
+        """, (uid,))
+
+        await db.commit()
+        return cur.rowcount > 0
+
+# =========================
+# INDICATORS
 # =========================
 
 def rsi(prices, period=14):
@@ -98,9 +134,6 @@ def rsi(prices, period=14):
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
-# =========================
-# SMA
-# =========================
 
 def sma(prices, period=20):
     if len(prices) < period:
@@ -114,42 +147,47 @@ def sma(prices, period=20):
 async def get_tickers(session):
     url = "https://iss.moex.com/iss/engines/stock/markets/shares/boards/TQBR/securities.json"
 
-    try:
-        async with session.get(url, timeout=20) as r:
-            data = await r.json()
-            return [x[0] for x in data["securities"]["data"]]
-    except Exception as e:
-        log.error(f"tickers error: {e}")
-        return []
+    async with session.get(url, timeout=20) as r:
+        data = await r.json()
+
+    return [x[0] for x in data["securities"]["data"]]
+
 
 async def get_candles(session, ticker):
     url = f"https://iss.moex.com/iss/engines/stock/markets/shares/securities/{ticker}/candles.json?interval=60&limit=80"
 
-    try:
-        async with session.get(url, timeout=15) as r:
-            data = await r.json()
+    async with session.get(url, timeout=15) as r:
+        data = await r.json()
 
-        candles = data.get("candles", {}).get("data", [])
-        if not candles:
-            return [], [], []
+    candles = data.get("candles", {}).get("data", [])
 
-        times = [c[0] for c in candles]
-
-        # RAW CLOSE
-        raw_closes = [c[4] for c in candles]
-        volumes = [c[5] for c in candles]
-
-        # CLEAN PRICE
-        closes = [normalize_price(c) for c in raw_closes]
-
-        return times, closes, volumes
-
-    except Exception as e:
-        log.error(f"candles error: {e}")
+    if not candles:
         return [], [], []
 
+    times = [c[0] for c in candles]
+    closes = [c[4] for c in candles]
+    volumes = [c[5] for c in candles]
+
+    return times, closes, volumes
+
 # =========================
-# ANALYSIS
+# SEND
+# =========================
+
+async def send_signal(text, kb, ticker, sig_type):
+    users = await get_users()
+
+    for uid, is_pro in users:
+        if not await update_limit(uid, is_pro):
+            continue
+
+        try:
+            await bot.send_message(uid, text, reply_markup=kb)
+        except:
+            pass
+
+# =========================
+# ANALYZE
 # =========================
 
 async def analyze(session, ticker, sem):
@@ -161,10 +199,7 @@ async def analyze(session, ticker, sem):
                 return
 
             candle_time = times[-1]
-
             price = closes[-1]
-            if price <= 0:
-                return
 
             rsi_val = rsi(closes)
             sma_val = sma(closes)
@@ -172,7 +207,6 @@ async def analyze(session, ticker, sem):
             signals = []
             sig_type = "TREND"
 
-            # RSI FIXED
             if rsi_val is not None:
                 if rsi_val < 30:
                     signals.append("RSI перепродан")
@@ -181,11 +215,9 @@ async def analyze(session, ticker, sem):
                     signals.append("RSI перекуплен")
                     sig_type = "REVERSAL"
 
-            # SMA
             if sma_val:
                 signals.append("Цена относительно SMA")
 
-            # breakout
             if price > max(closes[-20:]):
                 signals.append("Пробой вверх")
                 sig_type = "BREAKOUT"
@@ -193,7 +225,7 @@ async def analyze(session, ticker, sem):
             if len(signals) < 2:
                 return
 
-            # anti-duplicate by candle
+            # 🔥 АНТИДУБЛИКАТ ПО СВЕЧЕ
             if is_duplicate(ticker, candle_time, sig_type):
                 return
 
@@ -212,28 +244,13 @@ async def analyze(session, ticker, sem):
 📊 Сигналы:
 """ + "\n".join(signals)
 
-            users = await get_users()
-
-            for uid, is_pro in users:
-                try:
-                    await bot.send_message(uid, text, reply_markup=kb)
-                except:
-                    pass
+            await send_signal(text, kb, ticker, sig_type)
 
         except Exception as e:
             log.error(f"{ticker}: {e}")
 
 # =========================
-# USERS
-# =========================
-
-async def get_users():
-    async with aiosqlite.connect(DB) as db:
-        cur = await db.execute("SELECT user_id, is_pro FROM users")
-        return await cur.fetchall()
-
-# =========================
-# SCAN
+# SCAN LOOP
 # =========================
 
 async def scan():
@@ -241,9 +258,6 @@ async def scan():
 
     async with aiohttp.ClientSession(timeout=timeout) as session:
         tickers = await get_tickers(session)
-
-        if not tickers:
-            return
 
         sem = asyncio.Semaphore(8)
 
@@ -266,12 +280,29 @@ async def loop():
         await asyncio.sleep(300)
 
 # =========================
-# MAIN
+# COMMANDS
+# =========================
+
+@dp.message(Command("start"))
+async def start(m: types.Message):
+    await add_user(m.from_user.id)
+    await m.answer("Бот запущен")
+
+
+# =========================
+# MAIN (ПРАВИЛЬНЫЙ ПОРЯДОК)
 # =========================
 
 async def main():
+    # 1. СНАЧАЛА БАЗА
+    await init_db()
+
+    # 2. ПОТОМ СКАНЕР
     asyncio.create_task(loop())
+
+    # 3. ПОТОМ BOT
     await dp.start_polling(bot)
+
 
 if __name__ == "__main__":
     asyncio.run(main())
