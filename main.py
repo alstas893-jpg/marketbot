@@ -2,13 +2,9 @@ import asyncio
 import aiohttp
 import aiosqlite
 import os
-import time
 import logging
 
-from datetime import datetime, timedelta
-from collections import defaultdict
 from dotenv import load_dotenv
-
 from aiogram import Bot, Dispatcher, types
 from aiogram.filters import Command
 from aiogram.enums import ParseMode
@@ -31,11 +27,7 @@ log = logging.getLogger("scanner")
 # =========================
 
 load_dotenv()
-
 TOKEN = os.getenv("BOT_TOKEN")
-FREE_LIMIT = int(os.getenv("FREE_LIMIT", 3))
-SCAN_INTERVAL = int(os.getenv("SCAN_INTERVAL", 300))
-SIGNAL_COOLDOWN = int(os.getenv("SIGNAL_COOLDOWN", 3600))
 
 if not TOKEN:
     raise ValueError("BOT_TOKEN not found")
@@ -53,57 +45,39 @@ dp = Dispatcher()
 
 DB = "users.db"
 
-sent_cache = defaultdict(dict)
-
 # =========================
-# DB
+# ANTI-DUPLICATES (BY CANDLE)
 # =========================
 
-async def init_db():
-    async with aiosqlite.connect(DB) as db:
-        await db.execute("""
-        CREATE TABLE IF NOT EXISTS users (
-            user_id INTEGER PRIMARY KEY,
-            is_pro INTEGER DEFAULT 0,
-            signals_today INTEGER DEFAULT 0,
-            last_reset TEXT
-        )
-        """)
-        await db.commit()
+sent_signals = set()
 
-
-async def add_user(uid):
-    async with aiosqlite.connect(DB) as db:
-        await db.execute("""
-        INSERT OR IGNORE INTO users (user_id, last_reset)
-        VALUES (?, ?)
-        """, (uid, datetime.now().date().isoformat()))
-        await db.commit()
-
-
-async def get_users():
-    async with aiosqlite.connect(DB) as db:
-        cur = await db.execute("SELECT user_id, is_pro FROM users")
-        return await cur.fetchall()
-
-
-async def update_limit(uid, is_pro):
-    if is_pro:
+def is_duplicate(ticker, candle_time, sig_type):
+    key = (ticker, candle_time, sig_type)
+    if key in sent_signals:
         return True
-
-    async with aiosqlite.connect(DB) as db:
-        cur = await db.execute("""
-        UPDATE users
-        SET signals_today = signals_today + 1
-        WHERE user_id = ? AND signals_today < ?
-        """, (uid, FREE_LIMIT))
-
-        await db.commit()
-        return cur.rowcount > 0
-
+    sent_signals.add(key)
+    return False
 
 # =========================
-# INDICATORS
+# PRICE NORMALIZATION (MOEX FIX)
+# =========================
+
+def normalize_price(price: float) -> float:
+    if price is None:
+        return 0
+
+    # MOEX garbage protection
+    if price > 10_000_000:
+        return price / 1000
+    if price > 1_000_000:
+        return price / 100
+    if price <= 0:
+        return 0
+
+    return price
+
+# =========================
+# RSI (CLEAN VERSION)
 # =========================
 
 def rsi(prices, period=14):
@@ -119,23 +93,19 @@ def rsi(prices, period=14):
     avg_loss = sum(losses) / period
 
     if avg_loss == 0:
-        return 100 if avg_gain > 0 else 50
+        return 100
 
     rs = avg_gain / avg_loss
     return 100 - (100 / (1 + rs))
 
+# =========================
+# SMA
+# =========================
 
 def sma(prices, period=20):
     if len(prices) < period:
         return None
     return sum(prices[-period:]) / period
-
-
-def atr(closes):
-    if len(closes) < 15:
-        return 0
-    return sum(abs(closes[i] - closes[i - 1]) for i in range(1, len(closes))) / len(closes)
-
 
 # =========================
 # MOEX DATA
@@ -152,7 +122,6 @@ async def get_tickers(session):
         log.error(f"tickers error: {e}")
         return []
 
-
 async def get_candles(session, ticker):
     url = f"https://iss.moex.com/iss/engines/stock/markets/shares/securities/{ticker}/candles.json?interval=60&limit=80"
 
@@ -162,66 +131,48 @@ async def get_candles(session, ticker):
 
         candles = data.get("candles", {}).get("data", [])
         if not candles:
-            return [], []
+            return [], [], []
 
-        closes = [c[4] for c in candles]
+        times = [c[0] for c in candles]
+
+        # RAW CLOSE
+        raw_closes = [c[4] for c in candles]
         volumes = [c[5] for c in candles]
 
-        return closes, volumes
+        # CLEAN PRICE
+        closes = [normalize_price(c) for c in raw_closes]
 
-    except Exception:
-        return [], []
+        return times, closes, volumes
 
-
-# =========================
-# SIGNAL LOGIC
-# =========================
-
-def is_duplicate(ticker, sig):
-    now = datetime.now()
-    last = sent_cache[ticker].get(sig)
-
-    if last and (now - last) < timedelta(seconds=SIGNAL_COOLDOWN):
-        return True
-
-    sent_cache[ticker][sig] = now
-    return False
-
-
-def format_volume(v):
-    if v > 1e9:
-        return f"{v/1e9:.1f}B"
-    if v > 1e6:
-        return f"{v/1e6:.1f}M"
-    if v > 1e3:
-        return f"{v/1e3:.1f}K"
-    return str(v)
-
+    except Exception as e:
+        log.error(f"candles error: {e}")
+        return [], [], []
 
 # =========================
-# ANALYZE
+# ANALYSIS
 # =========================
 
 async def analyze(session, ticker, sem):
     async with sem:
         try:
-            closes, volumes = await get_candles(session, ticker)
+            times, closes, volumes = await get_candles(session, ticker)
 
             if len(closes) < 40:
                 return
 
+            candle_time = times[-1]
+
             price = closes[-1]
+            if price <= 0:
+                return
+
             rsi_val = rsi(closes)
             sma_val = sma(closes)
-            vol = volumes[-1] if volumes else 0
-
-            avg_vol = sum(volumes[-20:]) / 20 if len(volumes) > 20 else 0
-            rvol = vol / avg_vol if avg_vol else 0
 
             signals = []
             sig_type = "TREND"
 
-            # RSI
+            # RSI FIXED
             if rsi_val is not None:
                 if rsi_val < 30:
                     signals.append("RSI перепродан")
@@ -232,10 +183,7 @@ async def analyze(session, ticker, sem):
 
             # SMA
             if sma_val:
-                if price > sma_val:
-                    signals.append("Цена выше SMA")
-                else:
-                    signals.append("Цена ниже SMA")
+                signals.append("Цена относительно SMA")
 
             # breakout
             if price > max(closes[-20:]):
@@ -245,58 +193,47 @@ async def analyze(session, ticker, sem):
             if len(signals) < 2:
                 return
 
-            if is_duplicate(ticker, sig_type):
+            # anti-duplicate by candle
+            if is_duplicate(ticker, candle_time, sig_type):
                 return
+
+            tv_link = f"https://www.tradingview.com/chart/?symbol=MOEX:{ticker}"
+
+            kb = InlineKeyboardMarkup(inline_keyboard=[
+                [InlineKeyboardButton(text="TradingView", url=tv_link)]
+            ])
 
             text = f"""
 <b>{ticker}</b>
 
 Тип: <b>{sig_type}</b>
 Цена: {price:.2f}
-RSI: {rsi_val:.1f if rsi_val else 'N/A'}
-RVOL: {rvol:.2f}
 
-📊
+📊 Сигналы:
 """ + "\n".join(signals)
 
-            kb = InlineKeyboardMarkup(inline_keyboard=[
-                [InlineKeyboardButton(text="TradingView", url=f"https://www.tradingview.com/chart/?symbol=MOEX:{ticker}")]
-            ])
+            users = await get_users()
 
-            await send_signal(text, kb, ticker, sig_type)
+            for uid, is_pro in users:
+                try:
+                    await bot.send_message(uid, text, reply_markup=kb)
+                except:
+                    pass
 
         except Exception as e:
             log.error(f"{ticker}: {e}")
 
+# =========================
+# USERS
+# =========================
+
+async def get_users():
+    async with aiosqlite.connect(DB) as db:
+        cur = await db.execute("SELECT user_id, is_pro FROM users")
+        return await cur.fetchall()
 
 # =========================
-# SEND
-# =========================
-
-async def send_signal(text, kb, ticker, sig_type):
-    users = await get_users()
-
-    if not users:
-        return
-
-    sent = 0
-
-    for uid, is_pro in users:
-        if not await update_limit(uid, is_pro):
-            continue
-
-        try:
-            await bot.send_message(uid, text, reply_markup=kb)
-            sent += 1
-            await asyncio.sleep(0.05)
-        except Exception:
-            pass
-
-    log.info(f"{ticker} -> {sig_type} sent to {sent} users")
-
-
-# =========================
-# SCAN ENGINE
+# SCAN
 # =========================
 
 async def scan():
@@ -306,18 +243,14 @@ async def scan():
         tickers = await get_tickers(session)
 
         if not tickers:
-            log.warning("no tickers")
             return
 
         sem = asyncio.Semaphore(8)
 
-        tasks = [
+        await asyncio.gather(*[
             analyze(session, t, sem)
             for t in tickers[:200]
-        ]
-
-        await asyncio.gather(*tasks)
-
+        ])
 
 # =========================
 # LOOP
@@ -330,35 +263,15 @@ async def loop():
         except Exception as e:
             log.error(f"loop error: {e}")
 
-        await asyncio.sleep(SCAN_INTERVAL)
-
-
-# =========================
-# COMMANDS
-# =========================
-
-@dp.message(Command("start"))
-async def start(m: types.Message):
-    await add_user(m.from_user.id)
-    await m.answer("Бот запущен")
-
-
-@dp.message(Command("status"))
-async def status(m: types.Message):
-    await m.answer("OK")
-
+        await asyncio.sleep(300)
 
 # =========================
 # MAIN
 # =========================
 
 async def main():
-    await init_db()
-
     asyncio.create_task(loop())
-
     await dp.start_polling(bot)
-
 
 if __name__ == "__main__":
     asyncio.run(main())
